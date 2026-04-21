@@ -454,3 +454,14 @@ end)
 
 updateSpeedVisual()
 updateFlyButton()
+
+local guiVisible = true
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+
+	if input.KeyCode == Enum.KeyCode.G then
+		guiVisible = not guiVisible
+		gui.Enabled = guiVisible
+	end
+end)
