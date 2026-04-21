@@ -1,0 +1,1981 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local ServerScriptService = game:GetService("ServerScriptService")
+local StarterPlayer = game:GetService("StarterPlayer")
+
+local function getOrCreate(parent, className, name)
+	local obj = parent:FindFirstChild(name)
+	if not obj then
+		obj = Instance.new(className)
+		obj.Name = name
+		obj.Parent = parent
+	end
+	return obj
+end
+
+local sharedSource = [==[
+local Shared = {}
+
+Shared.ADMINS = {
+	["Noobchik7689"] = true,
+	-- ["ДругойНик"] = true,
+}
+
+Shared.TOPIC = "ADMIN_GLOBAL_MESSAGE_V3"
+
+Shared.REMOTES_FOLDER_NAME = "AdminRemotes"
+
+Shared.REMOTES = {
+	CheckAdmin = "CheckAdmin",
+	GetPlayersList = "GetPlayersList",
+	SetWalkSpeed = "SetWalkSpeed",
+	SendGlobalMessage = "SendGlobalMessage",
+	SendServerMessage = "SendServerMessage",
+	FlyCommand = "FlyCommand",
+	ShowGlobalMessage = "ShowGlobalMessage",
+	PunishmentAction = "PunishmentAction",
+	NotifyClient = "NotifyClient",
+	TeleportAction = "TeleportAction",
+	HealthAction = "HealthAction",
+	MaskAction = "MaskAction",
+	PrankAction = "PrankAction",
+	ServerControl = "ServerControl",
+	PunishmentTimer = "PunishmentTimer",
+}
+
+return Shared
+]==]
+
+local serverSource = [==[
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MessagingService = game:GetService("MessagingService")
+local DataStoreService = game:GetService("DataStoreService")
+local RunService = game:GetService("RunService")
+local TeleportService = game:GetService("TeleportService")
+
+local Shared = require(ReplicatedStorage:WaitForChild("AdminPanelShared"))
+
+local ADMINS = Shared.ADMINS
+local TOPIC = Shared.TOPIC
+
+local tempBanStore = DataStoreService:GetDataStore("AdminTempBans_v3")
+local permBanStore = DataStoreService:GetDataStore("AdminPermBans_v3")
+
+local remotesFolder = ReplicatedStorage:FindFirstChild(Shared.REMOTES_FOLDER_NAME)
+if not remotesFolder then
+	remotesFolder = Instance.new("Folder")
+	remotesFolder.Name = Shared.REMOTES_FOLDER_NAME
+	remotesFolder.Parent = ReplicatedStorage
+end
+
+local function getOrCreate(className, name)
+	local obj = remotesFolder:FindFirstChild(name)
+	if not obj then
+		obj = Instance.new(className)
+		obj.Name = name
+		obj.Parent = remotesFolder
+	end
+	return obj
+end
+
+local CheckAdminRF = getOrCreate("RemoteFunction", Shared.REMOTES.CheckAdmin)
+local GetPlayersRF = getOrCreate("RemoteFunction", Shared.REMOTES.GetPlayersList)
+
+local SetWalkSpeedRE = getOrCreate("RemoteEvent", Shared.REMOTES.SetWalkSpeed)
+local SendGlobalMessageRE = getOrCreate("RemoteEvent", Shared.REMOTES.SendGlobalMessage)
+local SendServerMessageRE = getOrCreate("RemoteEvent", Shared.REMOTES.SendServerMessage)
+local FlyCommandRE = getOrCreate("RemoteEvent", Shared.REMOTES.FlyCommand)
+local ShowGlobalMessageRE = getOrCreate("RemoteEvent", Shared.REMOTES.ShowGlobalMessage)
+local PunishmentRE = getOrCreate("RemoteEvent", Shared.REMOTES.PunishmentAction)
+local NotifyClientRE = getOrCreate("RemoteEvent", Shared.REMOTES.NotifyClient)
+local TeleportRE = getOrCreate("RemoteEvent", Shared.REMOTES.TeleportAction)
+local HealthRE = getOrCreate("RemoteEvent", Shared.REMOTES.HealthAction)
+local MaskRE = getOrCreate("RemoteEvent", Shared.REMOTES.MaskAction)
+local PrankRE = getOrCreate("RemoteEvent", Shared.REMOTES.PrankAction)
+local ServerControlRE = getOrCreate("RemoteEvent", Shared.REMOTES.ServerControl)
+local PunishmentTimerRE = getOrCreate("RemoteEvent", Shared.REMOTES.PunishmentTimer)
+
+local mutedPlayers = {}
+local mutedUntil = {}
+local shieldedPlayers = {}
+local invisiblePlayers = {}
+local invisibleState = {}
+local freezeTokens = {}
+local muteTokens = {}
+local serverLocked = false
+
+local function debugLog(...)
+	print("[AdminPanelServer]", ...)
+end
+
+local function isAdmin(player)
+	return player and ADMINS[player.Name] == true
+end
+
+local function notify(player, title, text)
+	if player then
+		NotifyClientRE:FireClient(player, tostring(title), tostring(text))
+	end
+end
+
+local function success(player, text)
+	debugLog("SUCCESS", player and player.Name or "nil", text)
+	notify(player, "Успешно", text)
+end
+
+local function fail(player, text)
+	debugLog("ERROR", player and player.Name or "nil", text)
+	notify(player, "Ошибка", text)
+end
+
+local function safeSet(store, key, value)
+	local ok, err = pcall(function()
+		store:SetAsync(key, value)
+	end)
+	if not ok then
+		warn("DataStore SetAsync error:", err)
+	end
+	return ok
+end
+
+local function safeGet(store, key)
+	local ok, result = pcall(function()
+		return store:GetAsync(key)
+	end)
+	if not ok then
+		warn("DataStore GetAsync error:", result)
+		return nil
+	end
+	return result
+end
+
+local function safeRemove(store, key)
+	local ok, err = pcall(function()
+		store:RemoveAsync(key)
+	end)
+	if not ok then
+		warn("DataStore RemoveAsync error:", err)
+	end
+	return ok
+end
+
+local function getPlayerByName(name)
+	if typeof(name) ~= "string" or name == "" then
+		return nil
+	end
+
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr.Name == name then
+			return plr
+		end
+	end
+
+	return nil
+end
+
+local function getUserIdFromName(name)
+	local ok, result = pcall(function()
+		return Players:GetUserIdFromNameAsync(name)
+	end)
+
+	if ok then
+		return result
+	end
+
+	return nil
+end
+
+local function getHumanoid(player)
+	if not player or not player.Character then
+		return nil
+	end
+	return player.Character:FindFirstChildOfClass("Humanoid")
+end
+
+local function getRoot(player)
+	if not player or not player.Character then
+		return nil
+	end
+	return player.Character:FindFirstChild("HumanoidRootPart")
+end
+
+local function resolveTargetInfo(selectedName, typedName)
+	local chosenName = nil
+
+	if typeof(selectedName) == "string" and selectedName ~= "" then
+		chosenName = selectedName
+	elseif typeof(typedName) == "string" and typedName ~= "" then
+		chosenName = typedName
+	end
+
+	if not chosenName then
+		return nil, nil, nil
+	end
+
+	local onlinePlayer = getPlayerByName(chosenName)
+	if onlinePlayer then
+		return onlinePlayer, onlinePlayer.UserId, onlinePlayer.Name
+	end
+
+	local userId = getUserIdFromName(chosenName)
+	if userId then
+		return nil, userId, chosenName
+	end
+
+	return nil, nil, chosenName
+end
+
+local function applyShield(player)
+	if not player or not player.Character then
+		return
+	end
+
+	local humanoid = getHumanoid(player)
+	if humanoid then
+		humanoid.Health = humanoid.MaxHealth
+	end
+
+	local ff = player.Character:FindFirstChild("AdminShieldForceField")
+	if not ff then
+		ff = Instance.new("ForceField")
+		ff.Name = "AdminShieldForceField"
+		ff.Visible = false
+		ff.Parent = player.Character
+	end
+end
+
+local function removeShield(player)
+	if not player or not player.Character then
+		return
+	end
+
+	local ff = player.Character:FindFirstChild("AdminShieldForceField")
+	if ff then
+		ff:Destroy()
+	end
+end
+
+local function setInvisible(player, enabled)
+	if not player or not player.Character then
+		return false
+	end
+
+	local char = player.Character
+	local uid = player.UserId
+
+	invisibleState[uid] = invisibleState[uid] or {}
+
+	for _, obj in ipairs(char:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			if enabled then
+				if invisibleState[uid][obj] == nil then
+					invisibleState[uid][obj] = {
+						Transparency = obj.Transparency,
+						CanCollide = obj.CanCollide
+					}
+				end
+				obj.Transparency = 1
+				obj.CanCollide = false
+			else
+				local saved = invisibleState[uid][obj]
+				if saved then
+					obj.Transparency = saved.Transparency
+					obj.CanCollide = saved.CanCollide
+				end
+			end
+		elseif obj:IsA("Decal") then
+			if enabled then
+				if invisibleState[uid][obj] == nil then
+					invisibleState[uid][obj] = {
+						Transparency = obj.Transparency
+					}
+				end
+				obj.Transparency = 1
+			else
+				local saved = invisibleState[uid][obj]
+				if saved then
+					obj.Transparency = saved.Transparency
+				end
+			end
+		end
+	end
+
+	if enabled then
+		invisiblePlayers[uid] = true
+	else
+		invisiblePlayers[uid] = nil
+		invisibleState[uid] = nil
+	end
+
+	return true
+end
+
+local function setFrozen(player, enabled)
+	local root = getRoot(player)
+	if not root then
+		return false
+	end
+
+	root.Anchored = enabled
+	return true
+end
+
+local function clearTimerForPlayer(player)
+	if not player then
+		return
+	end
+	PunishmentTimerRE:FireClient(player, "", 0)
+end
+
+local function stopMute(player, silent)
+	if not player then
+		return
+	end
+
+	local uid = player.UserId
+	muteTokens[uid] = nil
+	mutedPlayers[uid] = nil
+	mutedUntil[uid] = nil
+	clearTimerForPlayer(player)
+
+	if not silent then
+		notify(player, "Мут", "Мут снят")
+	end
+end
+
+local function stopFreeze(player, silent)
+	if not player then
+		return
+	end
+
+	local uid = player.UserId
+	freezeTokens[uid] = nil
+	setFrozen(player, false)
+	clearTimerForPlayer(player)
+
+	if not silent then
+		notify(player, "Заморозка", "Заморозка снята")
+	end
+end
+
+local function startTimedMute(player, minutes)
+	if not player then
+		return false
+	end
+
+	minutes = tonumber(minutes) or 0
+	if minutes <= 0 then
+		return false
+	end
+
+	local seconds = math.max(1, math.floor(minutes * 60))
+	local uid = player.UserId
+	local token = tostring(os.clock()) .. "_mute_" .. tostring(uid)
+
+	muteTokens[uid] = token
+	mutedPlayers[uid] = true
+	mutedUntil[uid] = os.time() + seconds
+
+	task.spawn(function()
+		for remaining = seconds, 1, -1 do
+			if muteTokens[uid] ~= token then
+				return
+			end
+
+			PunishmentTimerRE:FireClient(player, "Мут", remaining)
+			task.wait(1)
+		end
+
+		if muteTokens[uid] == token then
+			stopMute(player, true)
+			notify(player, "Мут", "Мут закончился")
+		end
+	end)
+
+	return true
+end
+
+local function startTimedFreeze(player, minutes)
+	if not player then
+		return false
+	end
+
+	minutes = tonumber(minutes) or 0
+	if minutes <= 0 then
+		return false
+	end
+
+	local seconds = math.max(1, math.floor(minutes * 60))
+	local uid = player.UserId
+	local token = tostring(os.clock()) .. "_freeze_" .. tostring(uid)
+
+	if not setFrozen(player, true) then
+		return false
+	end
+
+	freezeTokens[uid] = token
+
+	task.spawn(function()
+		for remaining = seconds, 1, -1 do
+			if freezeTokens[uid] ~= token then
+				return
+			end
+
+			PunishmentTimerRE:FireClient(player, "Заморозка", remaining)
+			task.wait(1)
+		end
+
+		if freezeTokens[uid] == token then
+			stopFreeze(player, true)
+			notify(player, "Заморозка", "Заморозка закончилась")
+		end
+	end)
+
+	return true
+end
+
+local function teleportPlayerToPlayer(playerA, playerB)
+	if not playerA or not playerB then
+		return false
+	end
+
+	local rootA = getRoot(playerA)
+	local rootB = getRoot(playerB)
+	if not rootA or not rootB then
+		return false
+	end
+
+	rootA.CFrame = rootB.CFrame + Vector3.new(3, 0, 0)
+	return true
+end
+
+local function setupPlayerState(player)
+	player.CharacterAdded:Connect(function()
+		task.defer(function()
+			if shieldedPlayers[player.UserId] then
+				applyShield(player)
+			end
+
+			if invisiblePlayers[player.UserId] then
+				setInvisible(player, true)
+			end
+
+			if freezeTokens[player.UserId] then
+				setFrozen(player, true)
+			end
+		end)
+	end)
+end
+
+CheckAdminRF.OnServerInvoke = function(player)
+	return isAdmin(player)
+end
+
+GetPlayersRF.OnServerInvoke = function(player)
+	if not isAdmin(player) then
+		return {}
+	end
+
+	local list = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		table.insert(list, plr.Name)
+	end
+
+	table.sort(list)
+	return list
+end
+
+Players.PlayerAdded:Connect(function(player)
+	if serverLocked and not isAdmin(player) then
+		player:Kick("Сервер закрыт администратором")
+		return
+	end
+
+	local permBan = safeGet(permBanStore, tostring(player.UserId))
+	if permBan == true then
+		player:Kick("Вы забанены")
+		return
+	end
+
+	local tempData = safeGet(tempBanStore, tostring(player.UserId))
+	if tempData and tempData.untilTime then
+		if os.time() < tempData.untilTime then
+			local left = tempData.untilTime - os.time()
+			player:Kick("Вы временно забанены. Осталось секунд: " .. tostring(left))
+			return
+		else
+			safeRemove(tempBanStore, tostring(player.UserId))
+		end
+	end
+
+	setupPlayerState(player)
+
+	player.Chatted:Connect(function()
+		if mutedPlayers[player.UserId] then
+			notify(player, "Мут", "У вас мут")
+		end
+	end)
+end)
+
+for _, player in ipairs(Players:GetPlayers()) do
+	setupPlayerState(player)
+end
+
+RunService.Heartbeat:Connect(function()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if shieldedPlayers[plr.UserId] then
+			local humanoid = getHumanoid(plr)
+			if humanoid and humanoid.Health < humanoid.MaxHealth then
+				humanoid.Health = humanoid.MaxHealth
+			end
+		end
+	end
+end)
+
+SetWalkSpeedRE.OnServerEvent:Connect(function(sender, targetName, speedValue)
+	if not isAdmin(sender) then
+		return
+	end
+
+	local target = getPlayerByName(targetName)
+	local speed = tonumber(speedValue)
+
+	if not target then
+		fail(sender, "Игрок не найден для скорости")
+		return
+	end
+
+	if not speed then
+		fail(sender, "Введите число скорости")
+		return
+	end
+
+	local humanoid = getHumanoid(target)
+	if not humanoid then
+		fail(sender, "У игрока нет Humanoid")
+		return
+	end
+
+	humanoid.WalkSpeed = math.clamp(speed, 0, 500)
+	success(sender, "Скорость " .. tostring(humanoid.WalkSpeed) .. " выдана игроку " .. target.Name)
+end)
+
+SendGlobalMessageRE.OnServerEvent:Connect(function(sender, text)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(text) ~= "string" then
+		fail(sender, "Некорректный текст сообщения")
+		return
+	end
+
+	text = string.sub(text, 1, 200)
+	if text == "" then
+		fail(sender, "Введите текст сообщения")
+		return
+	end
+
+	local ok, err = pcall(function()
+		MessagingService:PublishAsync(TOPIC, {
+			Author = sender.Name,
+			Text = text
+		})
+	end)
+
+	if not ok then
+		warn("PublishAsync error:", err)
+		ShowGlobalMessageRE:FireAllClients(sender.Name, text)
+		success(sender, "Сообщение отправлено только на текущий сервер")
+		return
+	end
+
+	success(sender, "Глобальное сообщение отправлено")
+end)
+
+SendServerMessageRE.OnServerEvent:Connect(function(sender, text)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(text) ~= "string" then
+		fail(sender, "Некорректный текст сообщения")
+		return
+	end
+
+	text = string.sub(text, 1, 200)
+	if text == "" then
+		fail(sender, "Введите текст сообщения")
+		return
+	end
+
+	ShowGlobalMessageRE:FireAllClients(sender.Name, text)
+	success(sender, "Сообщение отправлено на этот сервер")
+end)
+
+FlyCommandRE.OnServerEvent:Connect(function(sender, targetName, enabled, speed)
+	if not isAdmin(sender) then
+		return
+	end
+
+	local target = getPlayerByName(targetName)
+	if not target then
+		fail(sender, "Игрок для флая не найден")
+		return
+	end
+
+	FlyCommandRE:FireClient(target, enabled == true, tonumber(speed) or 50)
+	success(sender, (enabled and "Флай включён для " or "Флай выключен для ") .. target.Name)
+end)
+
+PunishmentRE.OnServerEvent:Connect(function(sender, action, data)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(data) ~= "table" then
+		fail(sender, "Некорректные данные наказания")
+		return
+	end
+
+	local selectedName = data.selectedTarget
+	local typedName = data.typedName
+	local minutes = tonumber(data.minutes) or 0
+
+	local onlineTarget, userId, resolvedName = resolveTargetInfo(selectedName, typedName)
+
+	if action == "Warn" then
+		if not onlineTarget then
+			fail(sender, "Варн можно выдать только игроку онлайн")
+			return
+		end
+
+		notify(onlineTarget, "Варн", "Вам выдано предупреждение администратором")
+		success(sender, "Варн выдан игроку " .. onlineTarget.Name)
+		return
+	end
+
+	if action == "Mute" then
+		if not onlineTarget then
+			fail(sender, "Мут можно выдать только игроку онлайн")
+			return
+		end
+
+		if minutes <= 0 then
+			fail(sender, "Введите количество минут для мута")
+			return
+		end
+
+		if startTimedMute(onlineTarget, minutes) then
+			notify(onlineTarget, "Мут", "Вам выдан мут на " .. tostring(minutes) .. " мин.")
+			success(sender, "Игроку " .. onlineTarget.Name .. " выдан мут на " .. tostring(minutes) .. " мин.")
+		else
+			fail(sender, "Не удалось выдать мут")
+		end
+		return
+	end
+
+	if action == "Unmute" then
+		if not onlineTarget then
+			fail(sender, "Размут можно сделать только игроку онлайн")
+			return
+		end
+
+		stopMute(onlineTarget, true)
+		notify(onlineTarget, "Мут", "Мут снят")
+		success(sender, "Игроку " .. onlineTarget.Name .. " снят мут")
+		return
+	end
+
+	if action == "Kick" then
+		if not onlineTarget then
+			fail(sender, "Кик можно сделать только игроку онлайн")
+			return
+		end
+
+		success(sender, "Игрок " .. onlineTarget.Name .. " кикнут")
+		onlineTarget:Kick("Кикнут администратором")
+		return
+	end
+
+	if action == "TempBan" then
+		if not userId or not resolvedName then
+			fail(sender, "Игрок для временного бана не найден")
+			return
+		end
+
+		if minutes <= 0 then
+			fail(sender, "Введите количество минут")
+			return
+		end
+
+		local untilTime = os.time() + math.floor(minutes * 60)
+		safeSet(tempBanStore, tostring(userId), {
+			untilTime = untilTime
+		})
+
+		if onlineTarget then
+			onlineTarget:Kick("Вы временно забанены на " .. tostring(minutes) .. " минут")
+		end
+
+		success(sender, "Игрок " .. resolvedName .. " временно забанен на " .. tostring(minutes) .. " мин.")
+		return
+	end
+
+	if action == "Ban" then
+		if not userId or not resolvedName then
+			fail(sender, "Игрок для перманентного бана не найден")
+			return
+		end
+
+		safeSet(permBanStore, tostring(userId), true)
+
+		if onlineTarget then
+			onlineTarget:Kick("Вы забанены")
+		end
+
+		success(sender, "Игрок " .. resolvedName .. " перманентно забанен")
+		return
+	end
+
+	if action == "Unban" then
+		if not userId or not resolvedName then
+			fail(sender, "Игрок для разбана не найден")
+			return
+		end
+
+		safeRemove(permBanStore, tostring(userId))
+		safeRemove(tempBanStore, tostring(userId))
+		success(sender, "Игрок " .. resolvedName .. " разбанен")
+		return
+	end
+
+	if action == "FreezeTimed" then
+		if not onlineTarget then
+			fail(sender, "Заморозить можно только игрока онлайн")
+			return
+		end
+
+		if minutes <= 0 then
+			fail(sender, "Введите количество минут для заморозки")
+			return
+		end
+
+		if startTimedFreeze(onlineTarget, minutes) then
+			notify(onlineTarget, "Заморозка", "Вы заморожены на " .. tostring(minutes) .. " мин.")
+			success(sender, "Игрок " .. onlineTarget.Name .. " заморожен на " .. tostring(minutes) .. " мин.")
+		else
+			fail(sender, "Не удалось заморозить игрока")
+		end
+		return
+	end
+
+	if action == "Unfreeze" then
+		if not onlineTarget then
+			fail(sender, "Разморозить можно только игрока онлайн")
+			return
+		end
+
+		stopFreeze(onlineTarget, true)
+		notify(onlineTarget, "Заморозка", "Заморозка снята")
+		success(sender, "Игрок " .. onlineTarget.Name .. " разморожен, таймер убран")
+		return
+	end
+
+	fail(sender, "Неизвестное наказание")
+end)
+
+HealthRE.OnServerEvent:Connect(function(sender, action, data)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(data) ~= "table" then
+		fail(sender, "Некорректные данные здоровья")
+		return
+	end
+
+	local target = getPlayerByName(data.target)
+	if not target then
+		fail(sender, "Игрок не найден")
+		return
+	end
+
+	local humanoid = getHumanoid(target)
+	if not humanoid then
+		fail(sender, "У игрока нет Humanoid")
+		return
+	end
+
+	if action == "Kill" then
+		humanoid.Health = 0
+		success(sender, "Игрок " .. target.Name .. " убит")
+		return
+	end
+
+	if action == "Heal" then
+		humanoid.Health = humanoid.MaxHealth
+		success(sender, "Игрок " .. target.Name .. " вылечен")
+		return
+	end
+
+	if action == "GiveShield" then
+		shieldedPlayers[target.UserId] = true
+		applyShield(target)
+		success(sender, "Щит выдан игроку " .. target.Name)
+		notify(target, "Щит", "Вам выдан щит")
+		return
+	end
+
+	if action == "RemoveShield" then
+		shieldedPlayers[target.UserId] = nil
+		removeShield(target)
+		success(sender, "Щит убран у " .. target.Name)
+		notify(target, "Щит", "Щит убран")
+		return
+	end
+
+	fail(sender, "Неизвестное действие здоровья")
+end)
+
+TeleportRE.OnServerEvent:Connect(function(sender, action, data)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(data) ~= "table" then
+		fail(sender, "Некорректные данные телепорта")
+		return
+	end
+
+	if action ~= "PlayerToPlayer" then
+		fail(sender, "Неизвестное действие телепорта")
+		return
+	end
+
+	local player1 = getPlayerByName(data.player1)
+	local player2 = getPlayerByName(data.player2)
+
+	if not player1 or not player2 then
+		fail(sender, "Выбери двух игроков")
+		return
+	end
+
+	if teleportPlayerToPlayer(player1, player2) then
+		success(sender, "Игрок " .. player1.Name .. " телепортирован к " .. player2.Name)
+	else
+		fail(sender, "Не удалось телепортировать игрока")
+	end
+end)
+
+MaskRE.OnServerEvent:Connect(function(sender, action, data)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(data) ~= "table" then
+		fail(sender, "Некорректные данные маскировки")
+		return
+	end
+
+	local target = getPlayerByName(data.target)
+	if not target then
+		fail(sender, "Игрок для маскировки не найден")
+		return
+	end
+
+	if action == "Invisible" then
+		if setInvisible(target, true) then
+			success(sender, "Игрок " .. target.Name .. " стал невидимым")
+		else
+			fail(sender, "Не удалось включить невидимость")
+		end
+		return
+	end
+
+	if action == "Visible" then
+		if setInvisible(target, false) then
+			success(sender, "Игрок " .. target.Name .. " снова видимый")
+		else
+			fail(sender, "Не удалось снять невидимость")
+		end
+		return
+	end
+
+	fail(sender, "Неизвестное действие маскировки")
+end)
+
+PrankRE.OnServerEvent:Connect(function(sender, action, data)
+	if not isAdmin(sender) then
+		return
+	end
+
+	if typeof(data) ~= "table" then
+		fail(sender, "Некорректные данные пранка")
+		return
+	end
+
+	local target = getPlayerByName(data.target)
+	if not target or not target.Character then
+		fail(sender, "Игрок для пранка не найден")
+		return
+	end
+
+	local character = target.Character
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+
+	if action == "Big" then
+		if humanoid then
+			local height = humanoid:FindFirstChild("BodyHeightScale")
+			local width = humanoid:FindFirstChild("BodyWidthScale")
+			local depth = humanoid:FindFirstChild("BodyDepthScale")
+			local head = humanoid:FindFirstChild("HeadScale")
+
+			if height then height.Value = 2 end
+			if width then width.Value = 2 end
+			if depth then depth.Value = 2 end
+			if head then head.Value = 2 end
+
+			success(sender, "Игрок " .. target.Name .. " увеличен")
+		else
+			fail(sender, "Не удалось увеличить игрока")
+		end
+		return
+	end
+
+	if action == "NormalSize" then
+		if humanoid then
+			local height = humanoid:FindFirstChild("BodyHeightScale")
+			local width = humanoid:FindFirstChild("BodyWidthScale")
+			local depth = humanoid:FindFirstChild("BodyDepthScale")
+			local head = humanoid:FindFirstChild("HeadScale")
+
+			if height then height.Value = 1 end
+			if width then width.Value = 1 end
+			if depth then depth.Value = 1 end
+			if head then head.Value = 1 end
+
+			success(sender, "Игрок " .. target.Name .. " возвращён к обычному размеру")
+		else
+			fail(sender, "Не удалось вернуть размер игрока")
+		end
+		return
+	end
+
+	if action == "Burn" then
+		if root and not root:FindFirstChild("AdminFire") then
+			local fire = Instance.new("Fire")
+			fire.Name = "AdminFire"
+			fire.Parent = root
+		end
+		success(sender, "Игрок " .. target.Name .. " подожжён")
+		return
+	end
+
+	if action == "Unburn" then
+		if root then
+			local fire = root:FindFirstChild("AdminFire")
+			if fire then
+				fire:Destroy()
+			end
+		end
+		success(sender, "Игрок " .. target.Name .. " потушен")
+		return
+	end
+
+	if action == "Launch" then
+		if root then
+			root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+			root:ApplyImpulse(Vector3.new(0, root.AssemblyMass * 120, 0))
+			success(sender, "Игрок " .. target.Name .. " подброшен")
+		else
+			fail(sender, "Не удалось подбросить игрока")
+		end
+		return
+	end
+
+	if action == "Seat" then
+		if humanoid then
+			humanoid.Sit = true
+			success(sender, "Игрок " .. target.Name .. " посажен")
+		else
+			fail(sender, "Не удалось посадить игрока")
+		end
+		return
+	end
+
+	fail(sender, "Неизвестный пранк")
+end)
+
+ServerControlRE.OnServerEvent:Connect(function(sender, action)
+	if not isAdmin(sender) then
+		return
+	end
+
+	action = tostring(action or "")
+
+	if action == "Lock" then
+		serverLocked = true
+		success(sender, "Сервер закрыт. Новые игроки не смогут зайти.")
+		return
+	end
+
+	if action == "Unlock" then
+		serverLocked = false
+		success(sender, "Сервер открыт.")
+		return
+	end
+
+	if action == "KickAll" then
+		local kicked = 0
+		for _, plr in ipairs(Players:GetPlayers()) do
+			if plr ~= sender then
+				kicked += 1
+				plr:Kick("Все игроки были выгнаны администратором")
+			end
+		end
+		success(sender, "Игроков выгнано: " .. tostring(kicked))
+		return
+	end
+
+	if action == "Shutdown" then
+		serverLocked = true
+		success(sender, "Сервер закрывается.")
+		for _, plr in ipairs(Players:GetPlayers()) do
+			plr:Kick("Сервер закрыт администратором")
+		end
+		return
+	end
+
+	if action == "Restart" then
+		serverLocked = true
+		success(sender, "Перезапуск сервера запущен")
+
+		local placeId = game.PlaceId
+		for _, plr in ipairs(Players:GetPlayers()) do
+			task.spawn(function()
+				local ok, err = pcall(function()
+					TeleportService:Teleport(placeId, plr)
+				end)
+
+				if not ok then
+					warn("Restart teleport failed:", plr.Name, err)
+					plr:Kick("Перезапуск сервера")
+				end
+			end)
+		end
+		return
+	end
+
+	fail(sender, "Неизвестная команда управления сервером")
+end)
+
+pcall(function()
+	MessagingService:SubscribeAsync(TOPIC, function(message)
+		local data = message.Data
+		if typeof(data) == "table" then
+			ShowGlobalMessageRE:FireAllClients(
+				tostring(data.Author or "Admin"),
+				tostring(data.Text or "")
+			)
+		end
+	end)
+end)
+]==]
+
+local clientSource = [==[
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+
+local Shared = require(ReplicatedStorage:WaitForChild("AdminPanelShared"))
+
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+
+local remotesFolder = ReplicatedStorage:WaitForChild(Shared.REMOTES_FOLDER_NAME)
+local CheckAdminRF = remotesFolder:WaitForChild(Shared.REMOTES.CheckAdmin)
+local GetPlayersRF = remotesFolder:WaitForChild(Shared.REMOTES.GetPlayersList)
+local SetWalkSpeedRE = remotesFolder:WaitForChild(Shared.REMOTES.SetWalkSpeed)
+local SendGlobalMessageRE = remotesFolder:WaitForChild(Shared.REMOTES.SendGlobalMessage)
+local SendServerMessageRE = remotesFolder:WaitForChild(Shared.REMOTES.SendServerMessage)
+local FlyCommandRE = remotesFolder:WaitForChild(Shared.REMOTES.FlyCommand)
+local ShowGlobalMessageRE = remotesFolder:WaitForChild(Shared.REMOTES.ShowGlobalMessage)
+local PunishmentRE = remotesFolder:WaitForChild(Shared.REMOTES.PunishmentAction)
+local NotifyClientRE = remotesFolder:WaitForChild(Shared.REMOTES.NotifyClient)
+local TeleportRE = remotesFolder:WaitForChild(Shared.REMOTES.TeleportAction)
+local HealthRE = remotesFolder:WaitForChild(Shared.REMOTES.HealthAction)
+local MaskRE = remotesFolder:WaitForChild(Shared.REMOTES.MaskAction)
+local PrankRE = remotesFolder:WaitForChild(Shared.REMOTES.PrankAction)
+local ServerControlRE = remotesFolder:WaitForChild(Shared.REMOTES.ServerControl)
+local PunishmentTimerRE = remotesFolder:WaitForChild(Shared.REMOTES.PunishmentTimer)
+
+local function notify(title, text)
+	pcall(function()
+		StarterGui:SetCore("SendNotification", {
+			Title = tostring(title),
+			Text = tostring(text),
+			Duration = 4
+		})
+	end)
+end
+
+NotifyClientRE.OnClientEvent:Connect(function(title, text)
+	notify(title, text)
+end)
+
+ShowGlobalMessageRE.OnClientEvent:Connect(function(author, text)
+	notify("Глобальное сообщение", "[" .. tostring(author) .. "]: " .. tostring(text))
+end)
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AdminPanelGui"
+screenGui.ResetOnSpawn = false
+screenGui.Enabled = false
+screenGui.Parent = playerGui
+
+local punishmentTimerLabel = Instance.new("TextLabel")
+punishmentTimerLabel.Size = UDim2.new(0, 220, 0, 42)
+punishmentTimerLabel.Position = UDim2.new(1, -240, 0, 20)
+punishmentTimerLabel.BackgroundColor3 = Color3.fromRGB(25, 25, 30)
+punishmentTimerLabel.TextColor3 = Color3.new(1, 1, 1)
+punishmentTimerLabel.Font = Enum.Font.GothamBold
+punishmentTimerLabel.TextSize = 18
+punishmentTimerLabel.Text = ""
+punishmentTimerLabel.Visible = false
+punishmentTimerLabel.Parent = screenGui
+
+local punishmentTimerCorner = Instance.new("UICorner")
+punishmentTimerCorner.CornerRadius = UDim.new(0, 8)
+punishmentTimerCorner.Parent = punishmentTimerLabel
+
+PunishmentTimerRE.OnClientEvent:Connect(function(punishmentName, remainingSeconds)
+	remainingSeconds = tonumber(remainingSeconds) or 0
+	punishmentName = tostring(punishmentName or "")
+
+	if remainingSeconds <= 0 or punishmentName == "" then
+		punishmentTimerLabel.Visible = false
+		punishmentTimerLabel.Text = ""
+		return
+	end
+
+	local minutes = math.floor(remainingSeconds / 60)
+	local seconds = remainingSeconds % 60
+	punishmentTimerLabel.Text = string.format("%s: %02d:%02d", punishmentName, minutes, seconds)
+	punishmentTimerLabel.Visible = true
+end)
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 780, 0, 620)
+mainFrame.Position = UDim2.new(0.5, -390, 0.5, -310)
+mainFrame.BackgroundColor3 = Color3.fromRGB(30, 30, 35)
+mainFrame.BorderSizePixel = 0
+mainFrame.Parent = screenGui
+
+local mainCorner = Instance.new("UICorner")
+mainCorner.CornerRadius = UDim.new(0, 10)
+mainCorner.Parent = mainFrame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 40)
+title.BackgroundTransparency = 1
+title.Text = "Админ-панель"
+title.TextColor3 = Color3.new(1, 1, 1)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 24
+title.Parent = mainFrame
+
+local dragBar = Instance.new("Frame")
+dragBar.Size = UDim2.new(1, -50, 0, 40)
+dragBar.Position = UDim2.new(0, 0, 0, 0)
+dragBar.BackgroundTransparency = 1
+dragBar.Active = true
+dragBar.Parent = mainFrame
+
+local dragging = false
+local dragInput = nil
+local dragStart = nil
+local startPos = nil
+
+local function updateDrag(input)
+	local delta = input.Position - dragStart
+	mainFrame.Position = UDim2.new(
+		startPos.X.Scale,
+		startPos.X.Offset + delta.X,
+		startPos.Y.Scale,
+		startPos.Y.Offset + delta.Y
+	)
+end
+
+dragBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		dragging = true
+		dragStart = input.Position
+		startPos = mainFrame.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+dragBar.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement then
+		dragInput = input
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if dragging and input == dragInput then
+		updateDrag(input)
+	end
+end)
+
+local closeButton = Instance.new("TextButton")
+closeButton.Size = UDim2.new(0, 35, 0, 35)
+closeButton.Position = UDim2.new(1, -45, 0, 5)
+closeButton.BackgroundColor3 = Color3.fromRGB(180, 60, 60)
+closeButton.Text = "X"
+closeButton.TextColor3 = Color3.new(1, 1, 1)
+closeButton.Font = Enum.Font.GothamBold
+closeButton.TextSize = 18
+closeButton.Parent = mainFrame
+
+local closeCorner = Instance.new("UICorner")
+closeCorner.CornerRadius = UDim.new(0, 8)
+closeCorner.Parent = closeButton
+
+closeButton.MouseButton1Click:Connect(function()
+	screenGui.Enabled = false
+end)
+
+local function createSection(parent, text, posY)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(0, 500, 0, 25)
+	lbl.Position = UDim2.new(0, 20, 0, posY)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = text
+	lbl.TextColor3 = Color3.new(1, 1, 1)
+	lbl.TextXAlignment = Enum.TextXAlignment.Left
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextSize = 18
+	lbl.Parent = parent
+	return lbl
+end
+
+local function createTextBox(parent, placeholder, x, y, w, h)
+	local box = Instance.new("TextBox")
+	box.Size = UDim2.new(0, w, 0, h)
+	box.Position = UDim2.new(0, x, 0, y)
+	box.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+	box.TextColor3 = Color3.new(1, 1, 1)
+	box.PlaceholderText = placeholder
+	box.PlaceholderColor3 = Color3.fromRGB(180, 180, 180)
+	box.Font = Enum.Font.Gotham
+	box.TextSize = 16
+	box.ClearTextOnFocus = false
+	box.Text = ""
+	box.Parent = parent
+
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = box
+
+	return box
+end
+
+local function createButton(parent, text, x, y, w, h)
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.new(0, w, 0, h)
+	btn.Position = UDim2.new(0, x, 0, y)
+	btn.BackgroundColor3 = Color3.fromRGB(70, 110, 255)
+	btn.TextColor3 = Color3.new(1, 1, 1)
+	btn.Text = text
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 15
+	btn.AutoButtonColor = true
+	btn.Parent = parent
+
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, 8)
+	c.Parent = btn
+
+	return btn
+end
+
+local function createLabel(parent, text, x, y, w, h)
+	local lbl = Instance.new("TextLabel")
+	lbl.Size = UDim2.new(0, w, 0, h)
+	lbl.Position = UDim2.new(0, x, 0, y)
+	lbl.BackgroundTransparency = 1
+	lbl.Text = text
+	lbl.TextColor3 = Color3.new(1, 1, 1)
+	lbl.Font = Enum.Font.GothamBold
+	lbl.TextSize = 20
+	lbl.Parent = parent
+	return lbl
+end
+
+local function createDropdown(parent, x, y, w, h)
+	local container = Instance.new("Frame")
+	container.Size = UDim2.new(0, w, 0, h + 130)
+	container.Position = UDim2.new(0, x, 0, y)
+	container.BackgroundTransparency = 1
+	container.Parent = parent
+
+	local selectedPlayer = nil
+
+	local openBtn = createButton(container, "Выбрать игрока", 0, 0, w, h)
+	openBtn.BackgroundColor3 = Color3.fromRGB(55, 55, 70)
+
+	local listFrame = Instance.new("Frame")
+	listFrame.Size = UDim2.new(0, w, 0, 130)
+	listFrame.Position = UDim2.new(0, 0, 0, h + 5)
+	listFrame.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+	listFrame.Visible = false
+	listFrame.ZIndex = 10
+	listFrame.Parent = container
+
+	local lc = Instance.new("UICorner")
+	lc.CornerRadius = UDim.new(0, 8)
+	lc.Parent = listFrame
+
+	local scrolling = Instance.new("ScrollingFrame")
+	scrolling.Size = UDim2.new(1, -10, 1, -10)
+	scrolling.Position = UDim2.new(0, 5, 0, 5)
+	scrolling.BackgroundTransparency = 1
+	scrolling.BorderSizePixel = 0
+	scrolling.CanvasSize = UDim2.new(0, 0, 0, 0)
+	scrolling.ScrollBarThickness = 6
+	scrolling.ZIndex = 11
+	scrolling.Parent = listFrame
+
+	local layout = Instance.new("UIListLayout")
+	layout.Padding = UDim.new(0, 4)
+	layout.Parent = scrolling
+
+	local function refresh()
+		for _, child in ipairs(scrolling:GetChildren()) do
+			if child:IsA("TextButton") then
+				child:Destroy()
+			end
+		end
+
+		local names = {}
+		local ok, result = pcall(function()
+			return GetPlayersRF:InvokeServer()
+		end)
+
+		if ok and typeof(result) == "table" then
+			names = result
+		end
+
+		for _, name in ipairs(names) do
+			local b = Instance.new("TextButton")
+			b.Size = UDim2.new(1, -5, 0, 28)
+			b.BackgroundColor3 = Color3.fromRGB(70, 70, 85)
+			b.TextColor3 = Color3.new(1, 1, 1)
+			b.Text = name
+			b.Font = Enum.Font.Gotham
+			b.TextSize = 15
+			b.ZIndex = 12
+			b.Parent = scrolling
+
+			local bc = Instance.new("UICorner")
+			bc.CornerRadius = UDim.new(0, 6)
+			bc.Parent = b
+
+			b.MouseButton1Click:Connect(function()
+				selectedPlayer = name
+				openBtn.Text = name
+				listFrame.Visible = false
+			end)
+		end
+
+		task.wait()
+		scrolling.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 5)
+	end
+
+	openBtn.MouseButton1Click:Connect(function()
+		listFrame.Visible = not listFrame.Visible
+		if listFrame.Visible then
+			refresh()
+		end
+	end)
+
+	return {
+		GetSelected = function()
+			return selectedPlayer
+		end,
+		Refresh = refresh,
+		SetNone = function()
+			selectedPlayer = nil
+			openBtn.Text = "Выбрать игрока"
+		end
+	}
+end
+
+local tabButtonsFrame = Instance.new("Frame")
+tabButtonsFrame.Size = UDim2.new(1, -20, 0, 45)
+tabButtonsFrame.Position = UDim2.new(0, 10, 0, 45)
+tabButtonsFrame.BackgroundTransparency = 1
+tabButtonsFrame.Parent = mainFrame
+
+local tab1Button = createButton(tabButtonsFrame, "Игроки", 0, 0, 160, 35)
+local tab2Button = createButton(tabButtonsFrame, "Контроль", 170, 0, 160, 35)
+local tab3Button = createButton(tabButtonsFrame, "Fun / Сервер", 340, 0, 160, 35)
+
+local function createTabScrollingFrame()
+	local frame = Instance.new("ScrollingFrame")
+	frame.Size = UDim2.new(1, -20, 1, -100)
+	frame.Position = UDim2.new(0, 10, 0, 90)
+	frame.BackgroundTransparency = 1
+	frame.BorderSizePixel = 0
+	frame.ScrollBarThickness = 8
+	frame.CanvasSize = UDim2.new(0, 0, 0, 0)
+	frame.Parent = mainFrame
+	return frame
+end
+
+local tab1Frame = createTabScrollingFrame()
+local tab2Frame = createTabScrollingFrame()
+local tab3Frame = createTabScrollingFrame()
+tab2Frame.Visible = false
+tab3Frame.Visible = false
+
+local function setCanvas(frame, height)
+	frame.CanvasSize = UDim2.new(0, 0, 0, height)
+end
+
+local function switchTab(tabNumber)
+	tab1Frame.Visible = tabNumber == 1
+	tab2Frame.Visible = tabNumber == 2
+	tab3Frame.Visible = tabNumber == 3
+
+	tab1Button.BackgroundColor3 = tabNumber == 1 and Color3.fromRGB(90, 130, 255) or Color3.fromRGB(70, 110, 255)
+	tab2Button.BackgroundColor3 = tabNumber == 2 and Color3.fromRGB(90, 130, 255) or Color3.fromRGB(70, 110, 255)
+	tab3Button.BackgroundColor3 = tabNumber == 3 and Color3.fromRGB(90, 130, 255) or Color3.fromRGB(70, 110, 255)
+end
+
+tab1Button.MouseButton1Click:Connect(function()
+	switchTab(1)
+end)
+
+tab2Button.MouseButton1Click:Connect(function()
+	switchTab(2)
+end)
+
+tab3Button.MouseButton1Click:Connect(function()
+	switchTab(3)
+end)
+
+createSection(tab1Frame, "Наказания", 10)
+local punishDropdown = createDropdown(tab1Frame, 20, 40, 180, 35)
+local punishOfflineBox = createTextBox(tab1Frame, "Ник оффлайн игрока", 220, 40, 180, 35)
+createLabel(tab1Frame, "на", 415, 42, 30, 30)
+local punishMinutesBox = createTextBox(tab1Frame, "Минуты", 450, 40, 90, 35)
+punishMinutesBox.Text = "10"
+
+local warnBtn = createButton(tab1Frame, "Варн", 20, 95, 90, 35)
+local muteBtn = createButton(tab1Frame, "Мут", 120, 95, 90, 35)
+local unmuteBtn = createButton(tab1Frame, "Размут", 220, 95, 100, 35)
+local kickBtn = createButton(tab1Frame, "Кик", 330, 95, 90, 35)
+local tempBanBtn = createButton(tab1Frame, "Врем. бан", 430, 95, 120, 35)
+
+local banBtn = createButton(tab1Frame, "Перма-бан", 20, 140, 120, 35)
+local unbanBtn = createButton(tab1Frame, "Разбан", 150, 140, 100, 35)
+local freezeTimedBtn = createButton(tab1Frame, "Заморозить", 260, 140, 130, 35)
+local unfreezeBtn = createButton(tab1Frame, "Разморозить", 400, 140, 130, 35)
+
+local function firePunishment(action)
+	PunishmentRE:FireServer(action, {
+		selectedTarget = punishDropdown.GetSelected(),
+		typedName = punishOfflineBox.Text,
+		minutes = tonumber(punishMinutesBox.Text) or 0
+	})
+end
+
+warnBtn.MouseButton1Click:Connect(function()
+	firePunishment("Warn")
+end)
+
+muteBtn.MouseButton1Click:Connect(function()
+	firePunishment("Mute")
+end)
+
+unmuteBtn.MouseButton1Click:Connect(function()
+	firePunishment("Unmute")
+end)
+
+kickBtn.MouseButton1Click:Connect(function()
+	firePunishment("Kick")
+end)
+
+tempBanBtn.MouseButton1Click:Connect(function()
+	firePunishment("TempBan")
+end)
+
+banBtn.MouseButton1Click:Connect(function()
+	firePunishment("Ban")
+end)
+
+unbanBtn.MouseButton1Click:Connect(function()
+	firePunishment("Unban")
+end)
+
+freezeTimedBtn.MouseButton1Click:Connect(function()
+	firePunishment("FreezeTimed")
+end)
+
+unfreezeBtn.MouseButton1Click:Connect(function()
+	firePunishment("Unfreeze")
+end)
+
+createSection(tab1Frame, "Здоровье", 210)
+local healthDropdown = createDropdown(tab1Frame, 20, 240, 180, 35)
+
+local removeShieldBtn = createButton(tab1Frame, "Убрать щит", 220, 240, 120, 35)
+local killBtn = createButton(tab1Frame, "Убить", 350, 240, 100, 35)
+local healBtn = createButton(tab1Frame, "Лечение", 460, 240, 110, 35)
+local giveShieldBtn = createButton(tab1Frame, "Выдать щит", 580, 240, 120, 35)
+
+removeShieldBtn.MouseButton1Click:Connect(function()
+	local target = healthDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+	HealthRE:FireServer("RemoveShield", {target = target})
+end)
+
+killBtn.MouseButton1Click:Connect(function()
+	local target = healthDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+	HealthRE:FireServer("Kill", {target = target})
+end)
+
+healBtn.MouseButton1Click:Connect(function()
+	local target = healthDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+	HealthRE:FireServer("Heal", {target = target})
+end)
+
+giveShieldBtn.MouseButton1Click:Connect(function()
+	local target = healthDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+	HealthRE:FireServer("GiveShield", {target = target})
+end)
+
+createSection(tab1Frame, "Скорость", 345)
+local speedBox = createTextBox(tab1Frame, "Введите скорость", 20, 375, 180, 35)
+speedBox.Text = "16"
+createLabel(tab1Frame, "для", 215, 377, 40, 30)
+local speedDropdown = createDropdown(tab1Frame, 260, 375, 180, 35)
+
+local speedActivateBtn = createButton(tab1Frame, "Активировать", 20, 430, 140, 35)
+local speedResetBtn = createButton(tab1Frame, "Сбросить", 170, 430, 120, 35)
+
+speedActivateBtn.MouseButton1Click:Connect(function()
+	local target = speedDropdown.GetSelected()
+	local speed = tonumber(speedBox.Text)
+
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+
+	if not speed then
+		notify("Ошибка", "Введите число скорости")
+		return
+	end
+
+	SetWalkSpeedRE:FireServer(target, speed)
+end)
+
+speedResetBtn.MouseButton1Click:Connect(function()
+	local target = speedDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+
+	SetWalkSpeedRE:FireServer(target, 16)
+end)
+
+setCanvas(tab1Frame, 500)
+
+createSection(tab2Frame, "Телепорт", 10)
+local tpDropdown1 = createDropdown(tab2Frame, 20, 40, 180, 35)
+createLabel(tab2Frame, "к", 220, 42, 30, 30)
+local tpDropdown2 = createDropdown(tab2Frame, 260, 40, 180, 35)
+
+local teleportBtn = createButton(tab2Frame, "Телепортировать", 20, 95, 180, 35)
+
+teleportBtn.MouseButton1Click:Connect(function()
+	local target1 = tpDropdown1.GetSelected()
+	local target2 = tpDropdown2.GetSelected()
+
+	if not target1 or not target2 then
+		notify("Ошибка", "Выбери двух игроков")
+		return
+	end
+
+	TeleportRE:FireServer("PlayerToPlayer", {
+		player1 = target1,
+		player2 = target2
+	})
+end)
+
+createSection(tab2Frame, "Флай", 170)
+local flyDropdown = createDropdown(tab2Frame, 20, 200, 180, 35)
+local flySpeedBox = createTextBox(tab2Frame, "Скорость флая", 220, 200, 130, 35)
+flySpeedBox.Text = "50"
+
+local flyOnBtn = createButton(tab2Frame, "Включить", 370, 200, 120, 35)
+local flyOffBtn = createButton(tab2Frame, "Выключить", 510, 200, 120, 35)
+
+flyOnBtn.MouseButton1Click:Connect(function()
+	local target = flyDropdown.GetSelected()
+	local speed = tonumber(flySpeedBox.Text)
+
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+
+	if not speed then
+		notify("Ошибка", "Введите скорость флая")
+		return
+	end
+
+	FlyCommandRE:FireServer(target, true, speed)
+end)
+
+flyOffBtn.MouseButton1Click:Connect(function()
+	local target = flyDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+
+	FlyCommandRE:FireServer(target, false, 0)
+end)
+
+createSection(tab2Frame, "Маскировка", 320)
+local maskDropdown = createDropdown(tab2Frame, 20, 350, 180, 35)
+
+local invisibleBtn = createButton(tab2Frame, "Невидимость", 220, 350, 140, 35)
+local visibleBtn = createButton(tab2Frame, "Снять невидимость", 370, 350, 180, 35)
+
+invisibleBtn.MouseButton1Click:Connect(function()
+	local target = maskDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+
+	MaskRE:FireServer("Invisible", {target = target})
+end)
+
+visibleBtn.MouseButton1Click:Connect(function()
+	local target = maskDropdown.GetSelected()
+	if not target then
+		notify("Ошибка", "Выбери игрока")
+		return
+	end
+
+	MaskRE:FireServer("Visible", {target = target})
+end)
+
+setCanvas(tab2Frame, 470)
+
+createSection(tab3Frame, "Пранки", 10)
+local prankDropdown = createDropdown(tab3Frame, 20, 40, 180, 35)
+
+local bigBtn = createButton(tab3Frame, "Увеличить", 220, 40, 140, 35)
+local normalBtn = createButton(tab3Frame, "Обычный", 370, 40, 140, 35)
+local burnBtn = createButton(tab3Frame, "Поджечь", 220, 90, 140, 35)
+local unburnBtn = createButton(tab3Frame, "Потушить", 370, 90, 140, 35)
+local launchBtn = createButton(tab3Frame, "Подбросить", 220, 140, 140, 35)
+local seatBtn = createButton(tab3Frame, "Посадить", 370, 140, 140, 35)
+
+bigBtn.MouseButton1Click:Connect(function()
+	local t = prankDropdown.GetSelected()
+	if not t then
+		return notify("Ошибка", "Выбери игрока")
+	end
+	PrankRE:FireServer("Big", {target = t})
+end)
+
+normalBtn.MouseButton1Click:Connect(function()
+	local t = prankDropdown.GetSelected()
+	if not t then
+		return notify("Ошибка", "Выбери игрока")
+	end
+	PrankRE:FireServer("NormalSize", {target = t})
+end)
+
+burnBtn.MouseButton1Click:Connect(function()
+	local t = prankDropdown.GetSelected()
+	if not t then
+		return notify("Ошибка", "Выбери игрока")
+	end
+	PrankRE:FireServer("Burn", {target = t})
+end)
+
+unburnBtn.MouseButton1Click:Connect(function()
+	local t = prankDropdown.GetSelected()
+	if not t then
+		return notify("Ошибка", "Выбери игрока")
+	end
+	PrankRE:FireServer("Unburn", {target = t})
+end)
+
+launchBtn.MouseButton1Click:Connect(function()
+	local t = prankDropdown.GetSelected()
+	if not t then
+		return notify("Ошибка", "Выбери игрока")
+	end
+	PrankRE:FireServer("Launch", {target = t})
+end)
+
+seatBtn.MouseButton1Click:Connect(function()
+	local t = prankDropdown.GetSelected()
+	if not t then
+		return notify("Ошибка", "Выбери игрока")
+	end
+	PrankRE:FireServer("Seat", {target = t})
+end)
+
+createSection(tab3Frame, "Оповещения", 220)
+local messageBox = createTextBox(tab3Frame, "Введите сообщение", 20, 250, 500, 35)
+local sendGlobalMessageBtn = createButton(tab3Frame, "На все серверы", 540, 250, 160, 35)
+local sendServerMessageBtn = createButton(tab3Frame, "На этот сервер", 540, 295, 160, 35)
+
+sendGlobalMessageBtn.MouseButton1Click:Connect(function()
+	local text = messageBox.Text
+	if text == "" then
+		notify("Ошибка", "Введите текст сообщения")
+		return
+	end
+
+	SendGlobalMessageRE:FireServer(text)
+	messageBox.Text = ""
+end)
+
+sendServerMessageBtn.MouseButton1Click:Connect(function()
+	local text = messageBox.Text
+	if text == "" then
+		notify("Ошибка", "Введите текст сообщения")
+		return
+	end
+
+	SendServerMessageRE:FireServer(text)
+	messageBox.Text = ""
+end)
+
+createSection(tab3Frame, "Управление сервером", 380)
+local restartBtn = createButton(tab3Frame, "Перезапуск", 20, 410, 140, 35)
+local shutdownBtn = createButton(tab3Frame, "Закрыть сервер", 170, 410, 150, 35)
+local lockBtn = createButton(tab3Frame, "Закрыть вход", 330, 410, 140, 35)
+local unlockBtn = createButton(tab3Frame, "Открыть вход", 480, 410, 140, 35)
+local kickAllBtn = createButton(tab3Frame, "Кик всех", 20, 460, 140, 35)
+
+restartBtn.MouseButton1Click:Connect(function()
+	ServerControlRE:FireServer("Restart")
+end)
+
+shutdownBtn.MouseButton1Click:Connect(function()
+	ServerControlRE:FireServer("Shutdown")
+end)
+
+lockBtn.MouseButton1Click:Connect(function()
+	ServerControlRE:FireServer("Lock")
+end)
+
+unlockBtn.MouseButton1Click:Connect(function()
+	ServerControlRE:FireServer("Unlock")
+end)
+
+kickAllBtn.MouseButton1Click:Connect(function()
+	ServerControlRE:FireServer("KickAll")
+end)
+
+setCanvas(tab3Frame, 540)
+
+local flyEnabled = false
+local flySpeed = 50
+local bodyVelocity = nil
+local bodyGyro = nil
+local flyConnection = nil
+
+local function stopFly()
+	flyEnabled = false
+
+	if flyConnection then
+		flyConnection:Disconnect()
+		flyConnection = nil
+	end
+
+	local character = player.Character
+	if character then
+		local root = character:FindFirstChild("HumanoidRootPart")
+		if root then
+			local bv = root:FindFirstChild("AdminFlyVelocity")
+			if bv then
+				bv:Destroy()
+			end
+
+			local bg = root:FindFirstChild("AdminFlyGyro")
+			if bg then
+				bg:Destroy()
+			end
+		end
+
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+		if humanoid then
+			humanoid.PlatformStand = false
+		end
+	end
+end
+
+local function startFly(speed)
+	stopFly()
+
+	flyEnabled = true
+	flySpeed = speed or 50
+
+	local character = player.Character or player.CharacterAdded:Wait()
+	local humanoid = character:WaitForChild("Humanoid")
+	local root = character:WaitForChild("HumanoidRootPart")
+
+	bodyVelocity = Instance.new("BodyVelocity")
+	bodyVelocity.Name = "AdminFlyVelocity"
+	bodyVelocity.MaxForce = Vector3.new(100000, 100000, 100000)
+	bodyVelocity.Velocity = Vector3.zero
+	bodyVelocity.Parent = root
+
+	bodyGyro = Instance.new("BodyGyro")
+	bodyGyro.Name = "AdminFlyGyro"
+	bodyGyro.MaxTorque = Vector3.new(100000, 100000, 100000)
+	bodyGyro.P = 10000
+	bodyGyro.CFrame = root.CFrame
+	bodyGyro.Parent = root
+
+	flyConnection = RunService.RenderStepped:Connect(function()
+		if not flyEnabled then
+			return
+		end
+
+		if not character or not character.Parent then
+			return
+		end
+
+		local camera = workspace.CurrentCamera
+		local moveDirection = Vector3.zero
+
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then
+			moveDirection += camera.CFrame.LookVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then
+			moveDirection -= camera.CFrame.LookVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then
+			moveDirection -= camera.CFrame.RightVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then
+			moveDirection += camera.CFrame.RightVector
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then
+			moveDirection += Vector3.new(0, 1, 0)
+		end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+			moveDirection -= Vector3.new(0, 1, 0)
+		end
+
+		if moveDirection.Magnitude > 0 then
+			moveDirection = moveDirection.Unit * flySpeed
+		end
+
+		bodyVelocity.Velocity = moveDirection
+		bodyGyro.CFrame = camera.CFrame
+		humanoid.PlatformStand = true
+	end)
+end
+
+FlyCommandRE.OnClientEvent:Connect(function(enabled, speed)
+	if enabled then
+		startFly(speed)
+	else
+		stopFly()
+	end
+end)
+
+player.CharacterAdded:Connect(function()
+	if flyEnabled then
+		task.wait(1)
+		startFly(flySpeed)
+	end
+end)
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.F4 then
+		local isAdminLocal = false
+
+		local ok, result = pcall(function()
+			return CheckAdminRF:InvokeServer()
+		end)
+
+		if ok then
+			isAdminLocal = result
+		end
+
+		if not isAdminLocal then
+			notify("Ошибка", "Нету доступа к админ-панели, свяжитесь с владельцем")
+			return
+		end
+
+		screenGui.Enabled = not screenGui.Enabled
+
+		if screenGui.Enabled then
+			switchTab(1)
+			punishDropdown.Refresh()
+			healthDropdown.Refresh()
+			speedDropdown.Refresh()
+			tpDropdown1.Refresh()
+			tpDropdown2.Refresh()
+			flyDropdown.Refresh()
+			maskDropdown.Refresh()
+			prankDropdown.Refresh()
+		end
+	end
+end)
+]==]
+
+local shared = getOrCreate(ReplicatedStorage, "ModuleScript", "AdminPanelShared")
+local server = getOrCreate(ServerScriptService, "Script", "AdminPanelServer")
+local client = getOrCreate(StarterPlayer.StarterPlayerScripts, "LocalScript", "AdminPanelClient")
+
+shared.Source = sharedSource
+server.Source = serverSource
+client.Source = clientSource
+
+print("Admin panel installed: Shared + Server + Client created.")
