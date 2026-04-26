@@ -1,0 +1,23 @@
+local uis = game:GetService("UserInputService")
+
+local mobile = "https://raw.githubusercontent.com/xaviersupreme/rustware/refs/heads/main/main/rustwaremobile"
+local pc = "https://raw.githubusercontent.com/xaviersupreme/rustware/refs/heads/main/main/rustware.lua"
+
+local url = (uis.TouchEnabled and not uis.KeyboardEnabled) and mobile or pc
+
+local success, result
+local attempts = 0
+
+repeat
+    attempts += 1
+
+    success, result = pcall(function()
+        return loadstring(game:HttpGet(url))()
+    end)
+
+    if not success then
+        warn(result)
+        task.wait(3)
+    end
+
+until success or attempts == 5
